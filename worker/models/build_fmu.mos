@@ -1,0 +1,12 @@
+// OpenModelica script — compile UAVPropulsion.mo to an FMI 2.0 CS FMU.
+// License: Apache-2.0
+setCommandLineOptions("--fmiFilter=blackBox");
+getErrorString();
+
+loadFile("UAVPropulsion.mo");
+getErrorString();
+
+// buildModelFMU is the current preferred API (replaces translateModelFMU).
+// It builds the full FMU end-to-end including native compile.
+buildModelFMU(UAVPropulsion, version = "2.0", fmuType = "cs", platforms = {"static"});
+getErrorString();

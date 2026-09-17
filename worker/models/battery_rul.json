@@ -1,0 +1,23 @@
+{
+  "model_type": "GaussianProcessRegressor",
+  "kernel": "ConstantKernel \u00d7 Matern(nu=5/2, ARD) + WhiteKernel",
+  "model_version": "0.1.0-phase3b",
+  "feature_order": [
+    "cycles_elapsed",
+    "soh",
+    "internal_r_ohm",
+    "peak_temp_c",
+    "capacity_slope",
+    "r_slope"
+  ],
+  "target": "rul_flights",
+  "target_transform": "log1p",
+  "ci_z": 1.645,
+  "cv_mean_rmse_flights": 46.458284111484986,
+  "cv_mean_coverage_90": 0.9236575733216883,
+  "calibration_mace": 0.032139994656692504,
+  "trained_on": "cell_cycles_synthetic.parquet",
+  "eol_soh_threshold": 0.7,
+  "cycles_per_flight": 0.2,
+  "notes": "GP on log-transformed RUL. Retrain on real fleet data before production."
+}

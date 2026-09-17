@@ -1,0 +1,129 @@
+# UAV Propulsion Digital Twin
+# License: Apache-2.0
+#
+# Two run modes via Compose profiles:
+#   Phase 1a — Python simulator (fast, no ArduPilot build):
+#       docker compose --profile sim up --build
+#   Phase 1b — Real ArduPilot SITL + MAVLink bridge:
+#       docker compose --profile sitl up --build
+#   The core (mosquitto, influxdb, worker, dashboard) is always on.
+#
+# Tear down: docker compose --profile sim down     (or --profile sitl)
+# Wipe data: docker compose down -v
+
+services:
+
+  # ------------------------------------------------------------------ core --
+  mosquitto:
+    image: eclipse-mosquitto:2
+    container_name: uavtwin-mosquitto
+    ports:
+      - "1883:1883"
+      - "9001:9001"
+    volumes:
+      - ./mosquitto/config:/mosquitto/config:ro
+      - mosquitto_data:/mosquitto/data
+      - mosquitto_log:/mosquitto/log
+    restart: unless-stopped
+
+  influxdb:
+    image: influxdb:2.7
+    container_name: uavtwin-influxdb
+    ports:
+      - "8086:8086"
+    environment:
+      DOCKER_INFLUXDB_INIT_MODE: setup
+      DOCKER_INFLUXDB_INIT_USERNAME: admin
+      DOCKER_INFLUXDB_INIT_PASSWORD: uavtwin-dev
+      DOCKER_INFLUXDB_INIT_ORG: uavtwin
+      DOCKER_INFLUXDB_INIT_BUCKET: telemetry
+      DOCKER_INFLUXDB_INIT_ADMIN_TOKEN: uavtwin-dev-token
+    volumes:
+      - influxdb_data:/var/lib/influxdb2
+      - influxdb_config:/etc/influxdb2
+    restart: unless-stopped
+
+  worker:
+    build: ./worker
+    container_name: uavtwin-worker
+    environment:
+      MQTT_HOST: mosquitto
+      MQTT_PORT: 1883
+      INFLUX_URL: http://influxdb:8086
+      INFLUX_TOKEN: uavtwin-dev-token
+      INFLUX_ORG: uavtwin
+      INFLUX_BUCKET: telemetry
+      UAV_ID: quad-01
+    depends_on:
+      - mosquitto
+      - influxdb
+    restart: unless-stopped
+
+  dashboard:
+    image: nginx:1.27-alpine
+    container_name: uavtwin-dashboard
+    ports:
+      - "8080:80"
+    volumes:
+      - ./dashboard:/usr/share/nginx/html:ro
+    depends_on:
+      - mosquitto
+    restart: unless-stopped
+
+  # ----------------------------------------------- Phase 1a — python sim --
+  simulator:
+    profiles: ["sim"]
+    build: ./simulator
+    container_name: uavtwin-simulator
+    environment:
+      MQTT_HOST: mosquitto
+      MQTT_PORT: 1883
+      UAV_ID: quad-01
+      MISSION_LOOP: "true"
+      TICK_HZ: "10"
+    depends_on:
+      - mosquitto
+    restart: unless-stopped
+
+  # ----------------------------------------------- Phase 1b — ArduPilot ---
+  sitl:
+    profiles: ["sitl"]
+    build:
+      context: ./sitl
+      args:
+        ARDUPILOT_TAG: Copter-4.5.7
+    container_name: uavtwin-sitl
+    environment:
+      SITL_HOME_LAT: "13.0827"
+      SITL_HOME_LON: "80.2707"
+      SITL_HOME_ALT: "10"
+      SITL_SPEEDUP: "1"
+    ports:
+      - "5760:5760"             # ArduCopter TCP MAVLink (external ground stations)
+    restart: unless-stopped
+
+  mavlink-bridge:
+    profiles: ["sitl"]
+    build: ./mavlink-bridge
+    container_name: uavtwin-bridge
+    environment:
+      MQTT_HOST: mosquitto
+      MQTT_PORT: 1883
+      MAVLINK_URL: "tcp:sitl:5760"
+      TICK_HZ: "10"
+      UAV_ID: quad-01
+      NUM_MOTORS: "4"
+      NUM_CELLS: "4"
+      SITL_HOME_LAT: "13.0827"
+      SITL_HOME_LON: "80.2707"
+      UPLOAD_MISSION: "true"
+    depends_on:
+      - mosquitto
+      - sitl
+    restart: unless-stopped
+
+volumes:
+  mosquitto_data:
+  mosquitto_log:
+  influxdb_data:
+  influxdb_config:

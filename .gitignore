@@ -1,0 +1,61 @@
+# -----------------------------------------------------------------------------
+# UAV twin repository .gitignore
+# -----------------------------------------------------------------------------
+
+# Session / editor / OS junk ---------------------------------------------------
+Claude outputs/
+.claude/
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# Python -----------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.venv/
+venv/
+env/
+.env
+.python-version
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Jupyter ----------------------------------------------------------------------
+.ipynb_checkpoints/
+*-checkpoint.ipynb
+.jupyter/
+
+# Node -------------------------------------------------------------------------
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+package-lock.json
+
+# Docker / runtime state -------------------------------------------------------
+# (docker-compose named volumes are managed by Docker, not the repo)
+*.pid
+*.log
+
+# Notebook outputs & downloaded data ------------------------------------------
+# 5+ GB NASA/ALFA datasets and the parquet features they produce are
+# reproducible from the notebooks; keep them out of the repo.
+notebooks/data/
+notebooks/downloads/
+
+# Build artifacts we intentionally ship still tracked:
+#   worker/models/UAVPropulsion.fmu    (compiled by OpenModelica in the Docker
+#                                       build; committing it lets someone
+#                                       skip the openmodelica stage 1)
+#   worker/models/bearing_wear.pkl     (trained model)
+#   worker/models/battery_rul.pkl      (trained model)

@@ -1,0 +1,824 @@
+<!DOCTYPE html>
+<!--
+  UAV Propulsion Digital Twin - Phase 3c Dashboard
+  Single-page, self-contained. FOSS: MIT (MQTT.js) + Apache-2.0 (ECharts).
+
+  Talks to Mosquitto over WebSocket (ws://<host>:9001).
+
+  Topic map (Phase 3c convention):
+    uav/<uav-id>/telemetry/state    - bridge or simulator, 10 Hz
+    uav/<uav-id>/twin/state         - FMU physics output, 10 Hz
+    uav/<uav-id>/twin/anomaly       - XGBoost bearing wear, every 2 s
+    uav/<uav-id>/twin/rul           - GP battery RUL, every 30 s
+    uav/<uav-id>/twin/alerts        - discrete threshold events
+    uav/<uav-id>/fault/inject       - fault-injection command (dashboard -> sim)
+
+  License: Apache-2.0
+-->
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>UAV Twin - quad-01</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <link rel="icon" href="data:," />
+  <script src="./vendor/mqtt.min.js"></script>
+  <script src="./vendor/echarts.min.js"></script>
+  <style>
+    :root {
+      /* Surfaces */
+      --bg:      #0b1220;
+      --panel:   #131c30;
+      --panel-2: #182541;
+      --line:    #223058;
+      --hairline:#1a2542;
+      /* Ink */
+      --ink:     #e8ecf5;
+      --ink-2:   #9aa4bd;
+      --ink-3:   #6b789a;
+      /* Categorical motor palette - dataviz reference slots 1-4, validated
+         on this dark surface: all six checks PASS (lightness band, chroma
+         floor, adjacent-CVD deltaE 8.4+, normal-vision deltaE 19.8+, contrast).
+         Same-hue values must stay in this order to preserve pairwise ratings. */
+      --m0: #3987e5;   /* slot 1 - blue */
+      --m1: #d95926;   /* slot 2 - orange */
+      --m2: #199e70;   /* slot 3 - aqua */
+      --m3: #c98500;   /* slot 4 - yellow */
+      /* Status - reserved, never used for series */
+      --ok:   #3ecf8e;
+      --warn: #f4b73a;
+      --crit: #ff6666;
+      /* Twin-vs-measured accent */
+      --twin: #7d8bb4;
+      /* Fonts */
+      --mono: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+    }
+
+    html, body {
+      margin: 0; padding: 0;
+      background: var(--bg); color: var(--ink);
+      font: 13px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
+    }
+
+    /* Header */
+    header {
+      display: flex; align-items: center; justify-content: space-between;
+      padding: 12px 20px; background: var(--panel);
+      border-bottom: 1px solid var(--line);
+    }
+    header .title { display: flex; gap: 10px; align-items: baseline; }
+    header h1 { font-size: 15px; font-weight: 600; margin: 0; letter-spacing: 0.02em; }
+    header h1 .id { color: var(--ink-2); font-weight: 400; margin-left: 6px; }
+    header .badges { display: flex; gap: 8px; align-items: center; }
+    .pill {
+      display: inline-flex; gap: 8px; align-items: center;
+      padding: 4px 10px; border-radius: 999px;
+      background: var(--panel-2); border: 1px solid var(--line);
+      font-family: var(--mono); font-size: 11px; color: var(--ink-2);
+    }
+    .pill.mode { text-transform: uppercase; letter-spacing: 0.05em; }
+    .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--ink-3); }
+    .dot.on { background: var(--ok); }
+    .dot.warn { background: var(--warn); }
+    .dot.crit { background: var(--crit); }
+
+    /* Layout */
+    main {
+      display: grid; grid-template-columns: minmax(0,1fr) 360px;
+      gap: 12px; padding: 12px 12px 20px;
+    }
+    .col-charts, .col-side { display: flex; flex-direction: column; gap: 12px; min-width: 0; }
+
+    /* Panels */
+    .panel {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      padding: 14px;
+    }
+    .panel h2 {
+      font-size: 11px; font-weight: 600; letter-spacing: 0.08em;
+      text-transform: uppercase; color: var(--ink-2);
+      margin: 0 0 10px;
+      display: flex; justify-content: space-between; align-items: baseline;
+    }
+    .panel h2 .sub {
+      font-family: var(--mono); font-size: 10px;
+      color: var(--ink-3); letter-spacing: 0.03em; text-transform: none;
+    }
+
+    /* Tile row */
+    .tiles { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; }
+    .tile {
+      background: var(--panel-2);
+      border-radius: 8px; padding: 12px 14px;
+    }
+    .tile .label { font-size: 10px; color: var(--ink-2); text-transform: uppercase; letter-spacing: 0.08em; }
+    .tile .value { font-family: var(--mono); font-size: 22px; margin-top: 4px; }
+    .tile .sub { font-size: 11px; color: var(--ink-3); margin-top: 3px; }
+    .tile.warn .value { color: var(--warn); }
+    .tile.crit .value { color: var(--crit); }
+    .tile.ok   .value { color: var(--ok); }
+
+    /* Motor color chips */
+    .swatch { display: inline-block; width: 8px; height: 8px; border-radius: 2px; margin-right: 4px; }
+
+    /* Charts */
+    .chart { width: 100%; height: 220px; }
+    .chart.short { height: 150px; }
+    .chart.mini  { height: 90px; }
+
+    /* RUL big card */
+    .rul-hero {
+      background: var(--panel-2);
+      border-radius: 8px;
+      padding: 14px 16px;
+      margin-bottom: 10px;
+    }
+    .rul-hero .lbl { font-size: 10px; color: var(--ink-2); text-transform: uppercase; letter-spacing: 0.08em; }
+    .rul-hero .median {
+      font-family: var(--mono); font-size: 30px; margin-top: 4px;
+    }
+    .rul-hero .median.warming { color: var(--ink-3); font-size: 18px; letter-spacing: 0.05em; }
+    .rul-hero .unit { color: var(--ink-2); font-size: 13px; margin-left: 6px; }
+    .rul-hero .range {
+      font-family: var(--mono); font-size: 12px; color: var(--ink-2); margin-top: 4px;
+    }
+    .rul-hero .range .p { color: var(--ink); }
+    .rul-hero .flights-obs { font-size: 11px; color: var(--ink-3); margin-top: 4px; }
+    .rul-band { position: relative; height: 10px; margin: 10px 0 4px; background: var(--panel); border-radius: 4px; overflow: hidden; }
+    .rul-band .fill {
+      position: absolute; top: 0; bottom: 0;
+      background: linear-gradient(90deg, rgba(57,135,229,.15), rgba(57,135,229,.5) 50%, rgba(57,135,229,.15));
+    }
+    .rul-band .marker {
+      position: absolute; top: -2px; bottom: -2px; width: 2px;
+      background: var(--m0);
+    }
+
+    /* Anomaly gauge row */
+    .anomaly-row {
+      display: flex; align-items: baseline; gap: 8px; margin-bottom: 10px;
+    }
+    .anomaly-row .num { font-family: var(--mono); font-size: 26px; }
+    .anomaly-row .num.warn { color: var(--warn); }
+    .anomaly-row .num.crit { color: var(--crit); }
+    .anomaly-row .lbl { font-size: 10px; color: var(--ink-2); text-transform: uppercase; letter-spacing: 0.08em; }
+    .anomaly-row .thresh {
+      margin-left: auto; font-family: var(--mono); font-size: 11px; color: var(--ink-3);
+    }
+
+    /* Motor bearing damage strip */
+    .damage-strip { display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; margin-top: 4px; }
+    .damage-cell { background: var(--panel-2); border-radius: 6px; padding: 8px 10px; }
+    .damage-cell .m { font-size: 10px; color: var(--ink-2); text-transform: uppercase; letter-spacing: 0.06em; }
+    .damage-cell .m .swatch { vertical-align: middle; }
+    .damage-cell .val { font-family: var(--mono); font-size: 14px; margin-top: 2px; }
+    .damage-cell .val.warn { color: var(--warn); }
+    .damage-cell .val.crit { color: var(--crit); }
+
+    /* Alerts */
+    .alerts { max-height: 260px; overflow-y: auto; }
+    .alerts .row {
+      display: flex; gap: 8px; align-items: flex-start;
+      padding: 8px 0; border-bottom: 1px solid var(--hairline);
+    }
+    .alerts .row:last-child { border-bottom: 0; }
+    .alerts .row .badge {
+      flex-shrink: 0;
+      display: inline-block; padding: 1px 6px; border-radius: 3px;
+      font-family: var(--mono); font-size: 9px;
+      text-transform: uppercase; letter-spacing: 0.06em;
+    }
+    .badge.warn { background: rgba(244,183,58,0.18); color: var(--warn); }
+    .badge.crit { background: rgba(255,102,102,0.18); color: var(--crit); }
+    .alerts .kind { font-family: var(--mono); font-size: 11px; color: var(--ink); }
+    .alerts .detail { font-size: 11px; color: var(--ink-2); margin-left: auto; }
+    .alerts .ts { font-size: 10px; color: var(--ink-3); font-family: var(--mono); }
+    .alerts .empty { color: var(--ink-3); padding: 12px 0; text-align: center; font-size: 12px; }
+
+    /* Fault injection */
+    .fault-panel button {
+      display: block; width: 100%; text-align: left;
+      margin: 4px 0; padding: 8px 10px;
+      background: var(--panel-2); color: var(--ink);
+      border: 1px solid var(--line); border-radius: 6px;
+      cursor: pointer;
+      font-family: var(--mono); font-size: 11px;
+      transition: background 0.15s;
+    }
+    .fault-panel button:hover { background: #223258; }
+    .fault-panel button.reset { color: var(--ok); border-color: rgba(62,207,142,0.4); }
+
+    /* Legend chips */
+    .legend-inline {
+      display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 6px;
+      font-family: var(--mono); font-size: 11px; color: var(--ink-2);
+    }
+    .legend-inline .item { display: inline-flex; gap: 5px; align-items: center; }
+
+    /* Small responsive: fold sidebar under charts */
+    @media (max-width: 1024px) {
+      main { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+
+<header>
+  <div class="title">
+    <h1>UAV Propulsion Twin <span class="id" id="uav-id-label">- quad-01</span></h1>
+  </div>
+  <div class="badges">
+    <span class="pill mode"><span class="dot on" id="dot-physics"></span><span id="mode-physics">physics: -</span></span>
+    <span class="pill mode"><span class="dot on" id="dot-ml"></span><span id="mode-ml">ml: -</span></span>
+    <span class="pill"><span class="dot" id="mqtt-dot"></span><span id="mqtt-status">connecting...</span></span>
+  </div>
+</header>
+
+<main>
+  <!-- =================== Charts column =================== -->
+  <section class="col-charts">
+
+    <div class="panel">
+      <h2>Mission & live state <span class="sub" id="last-tick">-</span></h2>
+      <div class="tiles">
+        <div class="tile">
+          <div class="label">Phase</div>
+          <div class="value" id="tile-phase">-</div>
+          <div class="sub" id="tile-loops">loops: -</div>
+        </div>
+        <div class="tile">
+          <div class="label">Battery SoC</div>
+          <div class="value" id="tile-soc">-</div>
+          <div class="sub" id="tile-pack-v">- V</div>
+        </div>
+        <div class="tile">
+          <div class="label">Pack current</div>
+          <div class="value" id="tile-ipack">-</div>
+          <div class="sub" id="tile-throttle">throttle: -</div>
+        </div>
+        <div class="tile">
+          <div class="label">Flight hours</div>
+          <div class="value" id="tile-hours">-</div>
+          <div class="sub" id="tile-batt-temp">batt T: -</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="panel">
+      <h2>Motor temperature <span class="sub">measured (solid) vs FMU predicted (dashed)</span></h2>
+      <div class="legend-inline">
+        <span class="item"><span class="swatch" style="background:var(--m0)"></span>Motor 0</span>
+        <span class="item"><span class="swatch" style="background:var(--m1)"></span>Motor 1</span>
+        <span class="item"><span class="swatch" style="background:var(--m2)"></span>Motor 2</span>
+        <span class="item"><span class="swatch" style="background:var(--m3)"></span>Motor 3</span>
+      </div>
+      <div id="chart-motor-temp" class="chart"></div>
+    </div>
+
+    <div class="panel">
+      <h2>Motor current <span class="sub">amps, per motor</span></h2>
+      <div id="chart-motor-current" class="chart short"></div>
+    </div>
+
+    <div class="panel">
+      <h2>Pack voltage <span class="sub">volts</span></h2>
+      <div id="chart-battery-v" class="chart short"></div>
+    </div>
+
+    <div class="panel">
+      <h2>State of charge <span class="sub">0 - 1</span></h2>
+      <div id="chart-battery-soc" class="chart short"></div>
+    </div>
+
+    <div class="panel">
+      <h2>Cell voltages <span class="sub">4S pack</span></h2>
+      <div id="chart-cells" class="chart short"></div>
+    </div>
+
+    <div class="panel">
+      <h2>Motor bearing damage <span class="sub">FMU integrator, 0 = new, 1 = end-of-life</span></h2>
+      <div id="chart-damage" class="chart short"></div>
+    </div>
+
+  </section>
+
+  <!-- =================== Side column =================== -->
+  <aside class="col-side">
+
+    <div class="panel">
+      <h2>Battery remaining life <span class="sub" id="rul-mode-sub">gp</span></h2>
+      <div class="rul-hero">
+        <div class="lbl">Flights remaining (median)</div>
+        <div id="rul-median" class="median warming">warming up</div>
+        <div class="rul-band" id="rul-band"><div class="fill" style="left:0;right:100%"></div><div class="marker" style="left:50%"></div></div>
+        <div class="range">90% CI: <span class="p" id="rul-p05">-</span> - <span class="p" id="rul-p95">-</span></div>
+        <div class="flights-obs" id="rul-obs">flights observed: 0</div>
+      </div>
+    </div>
+
+    <div class="panel">
+      <h2>Bearing wear (XGBoost) <span class="sub" id="anomaly-mode-sub">xgboost</span></h2>
+      <div class="anomaly-row">
+        <span class="num" id="anom-p">-</span>
+        <span class="lbl">p(fault)</span>
+        <span class="thresh">alert &#8805; 0.50</span>
+      </div>
+      <div id="chart-anomaly" class="chart mini"></div>
+    </div>
+
+    <div class="panel">
+      <h2>Per-motor bearing damage</h2>
+      <div class="damage-strip">
+        <div class="damage-cell"><div class="m"><span class="swatch" style="background:var(--m0)"></span>M0</div><div class="val" id="dmg-m0">-</div></div>
+        <div class="damage-cell"><div class="m"><span class="swatch" style="background:var(--m1)"></span>M1</div><div class="val" id="dmg-m1">-</div></div>
+        <div class="damage-cell"><div class="m"><span class="swatch" style="background:var(--m2)"></span>M2</div><div class="val" id="dmg-m2">-</div></div>
+        <div class="damage-cell"><div class="m"><span class="swatch" style="background:var(--m3)"></span>M3</div><div class="val" id="dmg-m3">-</div></div>
+      </div>
+    </div>
+
+    <div class="panel">
+      <h2>Alerts <span class="sub" id="alert-count">none</span></h2>
+      <div id="alerts" class="alerts"><div class="empty">no active alerts</div></div>
+    </div>
+
+    <div class="panel fault-panel">
+      <h2>Fault injection <span class="sub">sim profile only</span></h2>
+      <button data-fault='{"target":"motor","index":0,"kind":"efficiency","severity":0.3}'>Motor 0 - 30% efficiency loss</button>
+      <button data-fault='{"target":"motor","index":1,"kind":"bearing","severity":0.6}'>Motor 1 - bearing drag</button>
+      <button data-fault='{"target":"motor","index":2,"kind":"dead","severity":1.0}'>Motor 2 - dead</button>
+      <button data-fault='{"target":"cell","index":0,"kind":"cell_short","severity":1.0}'>Cell 0 - short</button>
+      <button data-fault='{"target":"cell","index":1,"kind":"soh_drop","severity":0.2}'>Cell 1 - SoH drop 20%</button>
+      <button class="reset" data-fault='{"target":"reset"}'>Reset all faults</button>
+    </div>
+
+  </aside>
+</main>
+
+<script>
+// ====================================================================
+//  Configuration
+// ====================================================================
+const UAV_ID = "quad-01";
+const WINDOW_SIZE = 300;    // rolling window for time-series charts
+
+// Categorical palette - fixed order, never cycled.
+// Dataviz reference slots 1-4 (blue, orange, aqua, yellow), validated
+// against this dark surface.
+const MOTOR_COLORS = ["#3987e5", "#d95926", "#199e70", "#c98500"];
+const TWIN_COLOR   = "#7d8bb4";  // FMU-predicted, low-chroma so measured pops
+const OK    = "#3ecf8e";
+const WARN  = "#f4b73a";
+const CRIT  = "#ff6666";
+const INK_2 = "#9aa4bd";
+const INK_3 = "#6b789a";
+const LINE_C = "#223058";
+const AXIS_C = "#3a4a70";
+
+// ====================================================================
+//  Rolling buffers
+// ====================================================================
+const T = [];                                       // x-axis timestamps
+const motorTemp     = [[], [], [], []];             // measured
+const motorTempFMU  = [[], [], [], []];             // FMU-predicted
+const motorCurr     = [[], [], [], []];
+const motorDamage   = [[], [], [], []];             // FMU integrator
+const packV         = [];
+const packSoc       = [];
+const cellsSeries   = [[], [], [], []];
+const anomP         = [];                           // p_fault history
+
+function push(arr, val) {
+  arr.push(val);
+  if (arr.length > WINDOW_SIZE) arr.shift();
+}
+
+// ====================================================================
+//  ECharts common setup
+// ====================================================================
+const gridDefault = { left: 46, right: 16, top: 18, bottom: 24, containLabel: false };
+const axisStyle = {
+  axisLine:  { lineStyle: { color: AXIS_C } },
+  axisTick:  { lineStyle: { color: AXIS_C } },
+  splitLine: { lineStyle: { color: LINE_C, type: [3, 4] } },
+  axisLabel: { color: INK_2, fontFamily: "ui-monospace", fontSize: 10 },
+};
+const tooltipStyle = {
+  trigger: "axis",
+  backgroundColor: "#0e1729",
+  borderColor: LINE_C,
+  textStyle: { color: "#e8ecf5", fontFamily: "ui-monospace", fontSize: 11 },
+  axisPointer: { lineStyle: { color: AXIS_C, type: "dashed" } },
+};
+
+function makeLineChart(id, seriesSpecs, opts = {}) {
+  const el = document.getElementById(id);
+  const c = echarts.init(el, null, { renderer: "canvas" });
+  c.setOption({
+    animation: false,
+    grid: opts.grid || gridDefault,
+    tooltip: tooltipStyle,
+    xAxis: { type: "category", data: T, boundaryGap: false, ...axisStyle },
+    yAxis: { type: "value", scale: true, ...axisStyle, ...(opts.yAxis || {}) },
+    series: seriesSpecs,
+  });
+  return c;
+}
+
+// One motor series spec (measured)
+function motorSeries(name, arr, i, extra = {}) {
+  return {
+    name, type: "line", data: arr, showSymbol: false, sampling: "lttb",
+    lineStyle: { color: MOTOR_COLORS[i], width: 1.6 },
+    itemStyle: { color: MOTOR_COLORS[i] },
+    emphasis: { focus: "series" },
+    ...extra,
+  };
+}
+function motorSeriesFMU(name, arr, i) {
+  return {
+    name, type: "line", data: arr, showSymbol: false, sampling: "lttb",
+    lineStyle: { color: TWIN_COLOR, width: 1.2, type: "dashed", opacity: 0.75 },
+    itemStyle: { color: TWIN_COLOR },
+    ...(i === 0 ? {} : { legendHoverLink: false }),  // only 1 twin legend entry
+  };
+}
+
+// ---- Motor temperature: measured (4 solid) + twin (4 dashed) ---------
+const chartTemp = makeLineChart("chart-motor-temp", [
+  motorSeries("M0 measured", motorTemp[0], 0),
+  motorSeries("M1 measured", motorTemp[1], 1),
+  motorSeries("M2 measured", motorTemp[2], 2),
+  motorSeries("M3 measured", motorTemp[3], 3),
+  motorSeriesFMU("Twin (FMU)", motorTempFMU[0], 0),
+  motorSeriesFMU("M1 twin",    motorTempFMU[1], 1),
+  motorSeriesFMU("M2 twin",    motorTempFMU[2], 2),
+  motorSeriesFMU("M3 twin",    motorTempFMU[3], 3),
+], { yAxis: { name: "deg C", nameTextStyle: { color: INK_2, fontSize: 10 } } });
+
+// ---- Motor current --------------------------------------------------
+const chartCurr = makeLineChart("chart-motor-current",
+  motorCurr.map((arr, i) => motorSeries(`Motor ${i}`, arr, i)),
+  { yAxis: { name: "A", nameTextStyle: { color: INK_2, fontSize: 10 } } }
+);
+
+// ---- Pack voltage (single series, single axis) ----------------------
+const chartPackV = makeLineChart("chart-battery-v", [{
+  name: "Pack V", type: "line", data: packV, showSymbol: false, sampling: "lttb",
+  lineStyle: { color: MOTOR_COLORS[0], width: 1.6 },
+  itemStyle: { color: MOTOR_COLORS[0] },
+  areaStyle: { color: "rgba(57,135,229,0.10)" },
+}], { yAxis: { name: "V", nameTextStyle: { color: INK_2, fontSize: 10 }, min: 12, max: 17.5 } });
+
+// ---- SoC (single series, single axis) - aqua so pack V stays distinct
+const chartSoc = makeLineChart("chart-battery-soc", [{
+  name: "SoC", type: "line", data: packSoc, showSymbol: false, sampling: "lttb",
+  lineStyle: { color: MOTOR_COLORS[2], width: 1.6 },
+  itemStyle: { color: MOTOR_COLORS[2] },
+  areaStyle: { color: "rgba(25,158,112,0.10)" },
+}], { yAxis: { name: "SoC", nameTextStyle: { color: INK_2, fontSize: 10 }, min: 0, max: 1 } });
+
+// ---- Cell voltages --------------------------------------------------
+const chartCells = makeLineChart("chart-cells",
+  cellsSeries.map((arr, i) => motorSeries(`Cell ${i}`, arr, i)),
+  { yAxis: { name: "V", nameTextStyle: { color: INK_2, fontSize: 10 }, min: 3.0, max: 4.3 } }
+);
+
+// ---- Motor bearing damage (log-ish tiny numbers) --------------------
+const chartDamage = makeLineChart("chart-damage",
+  motorDamage.map((arr, i) => motorSeries(`Motor ${i}`, arr, i)),
+  { yAxis: { name: "D", nameTextStyle: { color: INK_2, fontSize: 10 }, min: 0, max: 1 } }
+);
+
+// ---- Anomaly p_fault mini sparkline with 0.5 threshold overlay ------
+const chartAnom = echarts.init(document.getElementById("chart-anomaly"), null, { renderer: "canvas" });
+chartAnom.setOption({
+  animation: false,
+  grid: { left: 30, right: 6, top: 6, bottom: 18 },
+  tooltip: tooltipStyle,
+  xAxis: { type: "category", data: T, show: false, boundaryGap: false },
+  yAxis: {
+    type: "value", min: 0, max: 1,
+    ...axisStyle,
+    axisLabel: { color: INK_2, fontFamily: "ui-monospace", fontSize: 9 },
+  },
+  series: [
+    {
+      name: "p(fault)", type: "line", data: anomP,
+      showSymbol: false, sampling: "lttb",
+      lineStyle: { color: MOTOR_COLORS[0], width: 1.6 },
+      itemStyle: { color: MOTOR_COLORS[0] },
+      areaStyle: { color: "rgba(57,135,229,0.15)" },
+      markLine: {
+        symbol: "none", silent: true,
+        data: [{ yAxis: 0.5, name: "alert" }],
+        lineStyle: { color: WARN, type: "dashed", width: 1.2 },
+        label: { color: WARN, fontSize: 9, fontFamily: "ui-monospace",
+                 position: "insideEndTop", formatter: "0.50" },
+      },
+    }
+  ],
+});
+
+// ====================================================================
+//  MQTT
+// ====================================================================
+const DEMO_MODE = new URLSearchParams(location.search).has("demo");
+const wsHost = location.hostname || "localhost";
+const wsUrl  = `ws://${wsHost}:9001`;
+
+const dotMqtt = document.getElementById("mqtt-dot");
+const statMqtt = document.getElementById("mqtt-status");
+const modePhysicsEl = document.getElementById("mode-physics");
+const modeMlEl      = document.getElementById("mode-ml");
+const dotPhysics    = document.getElementById("dot-physics");
+const dotMl         = document.getElementById("dot-ml");
+
+// In DEMO_MODE we skip the real MQTT connection and pump synthesised
+// data into the same handlers. Great for reviewing the layout before
+// booting Docker, and for a static screenshot in the README.
+const client = DEMO_MODE
+  ? { subscribe(){}, publish(){}, on(){}, end(){} }
+  : mqtt.connect(wsUrl, {
+      clientId: `dash-${Math.random().toString(16).slice(2)}`,
+      reconnectPeriod: 2000,
+    });
+
+client.on("connect", () => {
+  dotMqtt.classList.add("on"); statMqtt.textContent = `connected · ${wsUrl}`;
+  client.subscribe([
+    `uav/${UAV_ID}/telemetry/state`,
+    `uav/${UAV_ID}/twin/state`,
+    `uav/${UAV_ID}/twin/anomaly`,
+    `uav/${UAV_ID}/twin/rul`,
+    `uav/${UAV_ID}/twin/alerts`,
+  ]);
+});
+client.on("reconnect", () => { dotMqtt.classList.remove("on"); statMqtt.textContent = "reconnecting..."; });
+client.on("close",     () => { dotMqtt.classList.remove("on"); statMqtt.textContent = "disconnected"; });
+client.on("error",   (e) => { dotMqtt.classList.remove("on"); statMqtt.textContent = `error: ${e.message}`; });
+
+// ====================================================================
+//  Message handlers
+// ====================================================================
+function fmt(v, d=2) { return (v == null || Number.isNaN(v)) ? "-" : (+v).toFixed(d); }
+function fmtInt(v)   { return (v == null || Number.isNaN(v)) ? "-" : Math.round(+v).toString(); }
+
+client.on("message", (topic, payload) => {
+  let msg;
+  try { msg = JSON.parse(payload.toString()); } catch { return; }
+  if      (topic.endsWith("/telemetry/state")) handleTelemetry(msg);
+  else if (topic.endsWith("/twin/state"))      handleTwinState(msg);
+  else if (topic.endsWith("/twin/anomaly"))    handleAnomaly(msg);
+  else if (topic.endsWith("/twin/rul"))        handleRul(msg);
+  else if (topic.endsWith("/twin/alerts"))     handleAlerts(msg);
+});
+
+// ---- Telemetry (raw from bridge / simulator) ------------------------
+function handleTelemetry(t) {
+  const ts = new Date((t.ts || Date.now()/1000) * 1000).toLocaleTimeString();
+  push(T, ts);
+  for (let i=0;i<4;i++) {
+    push(motorTemp[i], t.motors[i]?.temp_c ?? null);
+    push(motorCurr[i], t.motors[i]?.current_a ?? null);
+    push(cellsSeries[i], t.battery?.cells?.[i]?.v ?? null);
+  }
+  push(packV,   t.battery?.pack_v ?? null);
+  push(packSoc, t.battery?.soc ?? null);
+
+  // Redraw all telemetry-driven charts
+  chartCurr.setOption({ xAxis: { data: T },  series: motorCurr.map(d => ({ data: d })) });
+  chartPackV.setOption({ xAxis: { data: T }, series: [{ data: packV }] });
+  chartSoc.setOption({ xAxis: { data: T },   series: [{ data: packSoc }] });
+  chartCells.setOption({ xAxis: { data: T }, series: cellsSeries.map(d => ({ data: d })) });
+
+  document.getElementById("tile-phase").textContent    = t.phase ?? "-";
+  document.getElementById("tile-loops").textContent    = `loops: ${t.mission_loops ?? "-"}`;
+  document.getElementById("tile-soc").textContent      = t.battery ? `${fmt(t.battery.soc * 100, 1)}%` : "-";
+  document.getElementById("tile-pack-v").textContent   = t.battery ? `${fmt(t.battery.pack_v, 2)} V` : "-";
+  document.getElementById("tile-ipack").textContent    = t.battery ? `${fmt(t.battery.pack_i_a, 1)} A` : "-";
+  document.getElementById("tile-throttle").textContent = `throttle: ${fmt((t.throttle ?? 0) * 100, 0)}%`;
+  document.getElementById("tile-hours").textContent    = fmt(t.flight_hours, 3);
+  document.getElementById("tile-batt-temp").textContent = `batt T: ${fmt(t.battery?.temp_c, 1)} deg C`;
+  document.getElementById("last-tick").textContent = ts;
+}
+
+// ---- Twin state (FMU output) ----------------------------------------
+function handleTwinState(s) {
+  // Physics mode badge
+  if (s.physics) {
+    modePhysicsEl.textContent = `physics: ${s.physics}`;
+    dotPhysics.className = "dot on";
+  }
+  // FMU-predicted motor temps
+  if (Array.isArray(s.motor_temps_c)) {
+    for (let i=0;i<4;i++) push(motorTempFMU[i], s.motor_temps_c[i] ?? null);
+  }
+  // FMU bearing damage (0..1)
+  if (Array.isArray(s.motor_damage)) {
+    for (let i=0;i<4;i++) push(motorDamage[i], s.motor_damage[i] ?? null);
+    for (let i=0;i<4;i++) {
+      const d = s.motor_damage[i];
+      const cell = document.getElementById(`dmg-m${i}`);
+      const pct = (d * 100);
+      cell.textContent = pct < 0.001 ? "0.0000%" : `${fmt(pct, 4)}%`;
+      cell.className = "val" + (pct > 80 ? " crit" : pct > 50 ? " warn" : "");
+    }
+  }
+
+  // Charts that depend on twin state
+  chartTemp.setOption({ xAxis: { data: T }, series: [
+    { data: motorTemp[0] }, { data: motorTemp[1] },
+    { data: motorTemp[2] }, { data: motorTemp[3] },
+    { data: motorTempFMU[0] }, { data: motorTempFMU[1] },
+    { data: motorTempFMU[2] }, { data: motorTempFMU[3] },
+  ]});
+  chartDamage.setOption({ xAxis: { data: T }, series: motorDamage.map(d => ({ data: d })) });
+}
+
+// ---- Anomaly (XGBoost) ----------------------------------------------
+function handleAnomaly(a) {
+  const p = +a.p_fault;
+  push(anomP, p);
+
+  // ML mode badge
+  if (a.mode) {
+    modeMlEl.textContent = `ml: ${a.mode}`;
+    dotMl.className = "dot " + (a.mode === "xgboost" ? "on" : "warn");
+  }
+
+  const el = document.getElementById("anom-p");
+  el.textContent = fmt(p, 4);
+  el.className = "num" + (p >= 0.5 ? " crit" : p >= 0.25 ? " warn" : "");
+
+  chartAnom.setOption({ xAxis: { data: T }, series: [{ data: anomP }] });
+}
+
+// ---- RUL (Gaussian process) -----------------------------------------
+function handleRul(r) {
+  const medianEl = document.getElementById("rul-median");
+  const modeEl   = document.getElementById("rul-mode-sub");
+  const obsEl    = document.getElementById("rul-obs");
+
+  if (r.mode) modeEl.textContent = r.mode;
+  obsEl.textContent = `flights observed: ${r.flights_observed ?? 0}${r.reason ? ` · ${r.reason}` : ""}`;
+
+  if (r.unavailable) {
+    medianEl.textContent = r.reason === "warming_up" ? "warming up" : "unavailable";
+    medianEl.className = "median warming";
+    document.getElementById("rul-p05").textContent = "-";
+    document.getElementById("rul-p95").textContent = "-";
+    updateRulBand(null, null, null);
+    return;
+  }
+  medianEl.innerHTML = `${fmtInt(r.median)}<span class="unit">flights</span>`;
+  medianEl.className = "median";
+  document.getElementById("rul-p05").textContent = fmtInt(r.p05);
+  document.getElementById("rul-p95").textContent = fmtInt(r.p95);
+  updateRulBand(r.p05, r.median, r.p95);
+}
+
+// Position the CI fill and median marker within the horizontal band.
+// Scale: pin the p95 to 80% of the bar width so the band grows to
+// the right, and clip anything past that at 100%.
+function updateRulBand(p05, median, p95) {
+  const band = document.getElementById("rul-band");
+  const fill = band.querySelector(".fill");
+  const marker = band.querySelector(".marker");
+  if (p05 == null || median == null || p95 == null) {
+    fill.style.left = "0"; fill.style.right = "100%";
+    marker.style.left = "50%";
+    return;
+  }
+  const scale = Math.max(p95, 1) * 1.25;
+  const lo = Math.max(0, Math.min(100, (p05 / scale) * 100));
+  const hi = Math.max(0, Math.min(100, (p95 / scale) * 100));
+  const md = Math.max(0, Math.min(100, (median / scale) * 100));
+  fill.style.left  = `${lo}%`;
+  fill.style.right = `${100 - hi}%`;
+  marker.style.left = `calc(${md}% - 1px)`;
+}
+
+// ---- Alerts (discrete events) ---------------------------------------
+const alertLog = [];      // most-recent-first
+function handleAlerts(a) {
+  const now = new Date((a.ts || Date.now()/1000) * 1000).toLocaleTimeString();
+  if (!a.alerts || a.alerts.length === 0) return;
+  for (const x of a.alerts) alertLog.unshift({ ts: now, ...x });
+  while (alertLog.length > 40) alertLog.pop();
+  renderAlerts();
+}
+function renderAlerts() {
+  const el = document.getElementById("alerts");
+  const count = document.getElementById("alert-count");
+  if (alertLog.length === 0) {
+    el.innerHTML = `<div class="empty">no active alerts</div>`;
+    count.textContent = "none";
+    return;
+  }
+  count.textContent = `${alertLog.length}`;
+  el.innerHTML = alertLog.map(x => {
+    const sev = severityFor(x.kind);
+    return `<div class="row">
+      <span class="badge ${sev}">${sev}</span>
+      <span class="kind">${x.kind}</span>
+      <span class="detail">${fmt(x.value, 2)} / ${fmt(x.limit, 2)}</span>
+      <span class="ts">${x.ts}</span>
+    </div>`;
+  }).join("");
+}
+function severityFor(kind) {
+  if (!kind) return "warn";
+  if (kind.includes("dead") || kind.includes("crit") || kind.includes("bearing_wear")) return "crit";
+  return "warn";
+}
+
+// ====================================================================
+//  Fault-injection buttons
+// ====================================================================
+document.querySelectorAll(".fault-panel button").forEach(btn => {
+  btn.addEventListener("click", () => {
+    const p = btn.getAttribute("data-fault");
+    client.publish(`uav/${UAV_ID}/fault/inject`, p);
+    btn.style.background = "#2a3f6a";
+    setTimeout(() => btn.style.background = "", 400);
+  });
+});
+
+// ====================================================================
+//  Responsive resize
+// ====================================================================
+const allCharts = [chartTemp, chartCurr, chartPackV, chartSoc, chartCells, chartDamage, chartAnom];
+window.addEventListener("resize", () => allCharts.forEach(c => c.resize()));
+
+// ====================================================================
+//  Demo mode - visit ?demo=1 to preview with synthesised data (no Docker)
+// ====================================================================
+if (DEMO_MODE) {
+  dotMqtt.classList.add("on");
+  statMqtt.textContent = "connected · demo mode";
+  const now = Math.floor(Date.now() / 1000);
+  const rnd = (a, b) => a + Math.random() * (b - a);
+  const seed = (k) => {
+    const soc = 0.86 - k * 0.0007;
+    const pv  = 16.75 - k * 0.006 - Math.sin(k * 0.05) * 0.05;
+    const pi  = 20.8 + Math.sin(k * 0.25) * 1.6 + rnd(-0.4, 0.4);
+    const th  = 0.19 + Math.sin(k * 0.12) * 0.03;
+    const baseT = 32 + k * 0.02;
+    const tel = {
+      ts: now + k * 0.1, uav_id: "quad-01", phase: "cruise", throttle: th,
+      battery: {
+        pack_v: pv, pack_i_a: pi, soc: Math.max(0, soc), temp_c: 30 + k * 0.005,
+        cells: [
+          { idx: 0, v: 4.198 + Math.sin(k * 0.10) * 0.005, healthy: true },
+          { idx: 1, v: 4.202 + Math.cos(k * 0.11) * 0.005, healthy: true },
+          { idx: 2, v: 4.196 + Math.sin(k * 0.09) * 0.005, healthy: true },
+          { idx: 3, v: 4.204 + Math.cos(k * 0.12) * 0.005, healthy: true },
+        ],
+      },
+      motors: [0,1,2,3].map((i) => ({
+        idx: i,
+        rpm: 2440 + 5 * i + rnd(-15, 15),
+        current_a: 5.1 + Math.sin(k * 0.2 + i) * 0.4 + rnd(-0.15, 0.15),
+        voltage_v: pv - 0.05,
+        temp_c: baseT + rnd(-0.4, 0.4) + (i === 2 ? 0.6 : 0),
+        accum_ah: 0,
+      })),
+      flight_hours: 0.024 + k * 0.0001, mission_loops: 3, _source: "demo",
+    };
+    const ts = {
+      ts: tel.ts, uav_id: "quad-01", physics: "fmu",
+      SoC: tel.battery.soc, SoH: 0.997 - k * 3e-5,
+      V_pack: tel.battery.pack_v - 0.02, V_ocv: tel.battery.pack_v + 0.03,
+      Q_throughput: 0.62 + k * 2e-4,
+      motor_temps_c: tel.motors.map(m => m.temp_c - 1.2 - Math.sin(k * 0.07) * 0.2),
+      motor_damage:  [1.8e-6, 2.1e-6, 3.4e-6, 1.6e-6].map(v => v + k * 3e-9),
+    };
+    handleTelemetry(tel);
+    handleTwinState(ts);
+    if (k % 20 === 0) {
+      handleAnomaly({
+        ts: tel.ts, uav_id: "quad-01",
+        p_fault: 0.014 + Math.sin(k * 0.15) * 0.006, alert: false,
+        cross_max_asym: 0.18 + Math.sin(k * 0.09) * 0.05,
+        cross_max_temp_diff: 0.6 + Math.sin(k * 0.06) * 0.3,
+        mode: "xgboost",
+      });
+    }
+  };
+  for (let k = 0; k < 220; k++) seed(k);
+  handleRul({
+    ts: now, uav_id: "quad-01", mode: "gp", flights_observed: 7,
+    median: 47, p05: 22, p95: 89, unavailable: false,
+  });
+  handleAlerts({
+    ts: now, uav_id: "quad-01",
+    alerts: [
+      { kind: "motor_temp_spread",  value: 8.2, limit: 8.0 },
+      { kind: "motor_current_asym", value: 0.9, limit: 3.5 },
+    ],
+  });
+}
+</script>
+</body>
+</html>

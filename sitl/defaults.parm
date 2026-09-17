@@ -1,0 +1,53 @@
+# UAV Twin -- SITL default parameters for ArduCopter
+# Loaded on boot via sim_vehicle.py --add-param-file.
+# Sets up a realistic 4S 5000 mAh Li-ion pack, ESC telemetry, and
+# streaming rates that produce rich telemetry for the twin.
+#
+# License: Apache-2.0
+
+# --- Battery monitor: analog voltage + current from the simulated sensor ---
+BATT_MONITOR    4
+BATT_CAPACITY   5000
+BATT_LOW_VOLT   14.0
+BATT_CRT_VOLT   13.2
+
+# --- mAh-based failsafes: DISABLED for continuous test loops ------------------
+# The simulator drains SIM_BATT_CAP_AH across flights without resetting between
+# arm/disarm cycles. After ~20 mission loops the pack falls below the mAh
+# thresholds and pre-arm checks lock the vehicle out. Voltage-based failsafes
+# above stay active as the actual safety net.
+BATT_LOW_MAH    0
+BATT_CRT_MAH    0
+BATT_ARM_MAH    0
+BATT_ARM_VOLT   0
+BATT_FS_LOW_ACT 0
+BATT_FS_CRT_ACT 0
+
+# --- Simulator battery model -------------------------------------------------
+# Larger simulated capacity so a full-day test run never physically drains it.
+SIM_BATT_VOLTAGE 16.8
+SIM_BATT_CAP_AH  100.0
+
+# --- ESC telemetry on --------------------------------------------------------
+SIM_ESC_TELEM    1
+
+# --- Streaming rates on serial 0 (bridge's connection) -----------------------
+SR0_EXTRA1      10
+SR0_EXTRA2      10
+SR0_EXTRA3      5
+SR0_EXT_STAT    5
+SR0_POSITION    5
+SR0_RC_CHAN     2
+SR0_RAW_SENS    2
+
+# --- Fail-safes tuned so mission doesn't abort on our synthetic tests --------
+FS_GCS_ENABLE   0
+FS_THR_ENABLE   0
+FS_EKF_ACTION   1
+
+# --- Arming: keep pre-arm checks ON (they set the health bit our bridge
+#     watches). Disable only RC/rudder arming gestures that need a
+#     transmitter, which SITL doesn't simulate. The bridge additionally
+#     uses ArduPilot's force-arm magic (21196) so residual gates fall.
+ARMING_RUDDER   0
+SIM_RC_FAIL     0
