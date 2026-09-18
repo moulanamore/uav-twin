@@ -7,7 +7,11 @@ bearing damage), a **trained XGBoost classifier** for motor bearing wear, and
 a **Gaussian process** for battery remaining-useful-life — behind a live MQTT
 bus and a first-party HTML dashboard.
 
-![Dashboard hero](docs/dashboard-hero.png)
+**[▶ Live demo](https://moulanamore.github.io/uav-twin/)** — the dashboard
+with synthesised telemetry, running in your browser, no clone or Docker
+required.
+
+[![Dashboard hero](docs/dashboard-hero.png)](https://moulanamore.github.io/uav-twin/)
 
 *Live dashboard with the twin running against ArduPilot SITL: measured motor
 temperatures (solid) tracked against FMU prediction (dashed), 90% credible

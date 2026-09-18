@@ -523,7 +523,13 @@ chartAnom.setOption({
 // ====================================================================
 //  MQTT
 // ====================================================================
-const DEMO_MODE = new URLSearchParams(location.search).has("demo");
+// Demo mode is either explicitly requested via ?demo=1, or auto-enabled when
+// the dashboard is served from a static host (GitHub Pages, Cloudflare Pages,
+// Netlify) where there is no MQTT broker to connect to. Local docker deploys
+// (localhost / IP / .local hostnames) always try real MQTT first.
+const _staticHost = /\b(github\.io|pages\.dev|netlify\.app|vercel\.app)\b/i
+                      .test(location.hostname);
+const DEMO_MODE = new URLSearchParams(location.search).has("demo") || _staticHost;
 const wsHost = location.hostname || "localhost";
 const wsUrl  = `ws://${wsHost}:9001`;
 
